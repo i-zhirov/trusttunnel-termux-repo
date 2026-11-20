@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TrustTunnel for Termux</title>
+</head>
+<body>
+  <h1>TrustTunnel for Termux</h1>
+  <p>Prebuilt packages for the TrustTunnel endpoint and command-line client.</p>
+
+  <h2>Packages</h2>
+  <ul>
+__VERSIONS__
+  </ul>
+
+  <h2>Setup</h2>
+  <pre><code>pkg install -y curl gnupg
+curl -fsSL __KEY_URL__ \
+  -o "$PREFIX/etc/apt/trusted.gpg.d/trusttunnel.gpg"
+echo "deb [signed-by=$PREFIX/etc/apt/trusted.gpg.d/trusttunnel.gpg] __REPO_URL__ termux extras" \
+  > "$PREFIX/etc/apt/sources.list.d/trusttunnel.list"
+pkg update</code></pre>
+
+  <h2>Install</h2>
+  <pre><code>pkg install -y trusttunnel-client
+pkg install -y trusttunnel</code></pre>
+
+  <h2>Links</h2>
+  <ul>
+    <li><a href="https://github.com/TrustTunnel/TrustTunnel">TrustTunnel endpoint</a></li>
+    <li><a href="https://github.com/TrustTunnel/TrustTunnelClient">TrustTunnel client</a></li>
+    <li><a href="https://github.com/TrustTunnel/homebrew-tap">Homebrew tap</a></li>
+  </ul>
+</body>
+</html>

@@ -15,10 +15,12 @@ FROM base AS test
 COPY package.json ./
 COPY versions.json ./
 COPY scripts/ ./scripts/
+COPY templates/ ./templates/
 RUN npm test
 
 FROM base AS tools
 COPY package.json ./
 COPY versions.json ./
 COPY scripts/ ./scripts/
+COPY templates/ ./templates/
 CMD ["node", "scripts/build-repo.js"]

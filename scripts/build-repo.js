@@ -23,6 +23,7 @@ import {
   requireDigest,
   versionFromTag,
 } from "./packages.js";
+import { assembleSite } from "./site.js";
 
 const execFile = promisify(execFileCallback);
 const SHA256 = /^sha256:[0-9a-f]{64}$/;
@@ -297,6 +298,25 @@ export async function main(argv = process.argv.slice(2)) {
   }
 
   await writeVersions(options.root, nextVersions);
+
+  let publicKeyPath = null;
+  if (options.sign) {
+    publicKeyPath = join(buildRoot, "trusttunnel.gpg");
+    const { stdout } = await execFile("gpg", ["--export"], {
+      encoding: "buffer",
+    });
+    await writeFile(publicKeyPath, stdout);
+  }
+
+  await assembleSite({
+    siteDir: options.site,
+    debsDir: join(buildRoot, "debs"),
+    publicKeyPath,
+    templatePath: join(options.root, "templates/index.html"),
+    versions: nextVersions,
+    sign: options.sign,
+  });
+
   for (const deb of debs) {
     console.log(deb);
   }
