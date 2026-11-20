@@ -493,6 +493,162 @@ test("publish_conflict", async () => {
 });
 
 
+test("publish_skips_older_upstream", async (t) => {
+  if (
+    !hasCommand("dpkg-deb") ||
+    !hasCommand("gpg") ||
+    !hasCommand("python3")
+  ) {
+    t.skip("dpkg-deb, gpg, or python3 is not installed");
+    return;
+  }
+
+  const root = await tempDir("trusttunnel-publish-older-");
+  const originalFetch = globalThis.fetch;
+  const originalToken = process.env.GITHUB_TOKEN;
+  const originalRepository = process.env.GITHUB_REPOSITORY;
+  const originalHome = process.env.GNUPGHOME;
+  try {
+    const versionsText = '{\n  "trusttunnel-client": "1.4.0"\n}\n';
+    await writeFile(join(root, "versions.json"), versionsText);
+    await mkdir(join(root, "templates"), { recursive: true });
+    await writeFile(
+      join(root, "templates/index.html"),
+      "<html>__VERSIONS__</html>",
+    );
+
+    const seedRoot = join(root, "seed");
+    const seedBinary = join(seedRoot, "trusttunnel_client");
+    const seedLicense = join(seedRoot, "LICENSE");
+    await mkdir(seedRoot, { recursive: true });
+    await writeFile(seedBinary, "published binary");
+    await writeFile(seedLicense, "license");
+    const name = "trusttunnel-client_1.4.0_x86_64.deb";
+    const deb = await buildDeb({
+      root: join(seedRoot, "build"),
+      packageName: "trusttunnel-client",
+      version: "1.4.0",
+      arch: "x86_64",
+      binaryPath: seedBinary,
+      licensePath: seedLicense,
+    });
+    const debBytes = await readFile(deb);
+    const assetBytes = new Map([[name, debBytes]]);
+    const published = seedRelease(
+      1,
+      "trusttunnel-client-v1.4.0",
+      [name],
+      assetBytes,
+    );
+
+    const calls = [];
+    globalThis.fetch = async (url, init = {}) => {
+      calls.push({ url, method: init.method ?? "GET" });
+      if (
+        url ===
+        "https://api.github.com/repos/TrustTunnel/TrustTunnelClient/releases/latest"
+      ) {
+        return jsonResponse({
+          tag_name: "v1.2.0",
+          assets: [
+            {
+              name: "trusttunnel_client-v1.2.0-linux-x86_64.tar.gz",
+              digest: `sha256:${"0".repeat(64)}`,
+              browser_download_url: "https://example.test/older.tar.gz",
+            },
+          ],
+        });
+      }
+      if (url === `https://api.github.com/repos/${REPO}/releases?per_page=100`) {
+        return jsonResponse([published]);
+      }
+      if (url.startsWith("https://example.test/assets/")) {
+        const assetName = url.slice("https://example.test/assets/".length);
+        return new Response(assetBytes.get(assetName), { status: 200 });
+      }
+      throw new Error(`unexpected request ${init.method ?? "GET"} ${url}`);
+    };
+
+    const gnupg = join(root, "gnupg");
+    await mkdir(gnupg, { recursive: true, mode: 0o700 });
+    process.env.GITHUB_TOKEN = TOKEN;
+    process.env.GITHUB_REPOSITORY = REPO;
+    process.env.GNUPGHOME = gnupg;
+    await execFile("gpg", [
+      "--batch",
+      "--pinentry-mode",
+      "loopback",
+      "--passphrase",
+      "",
+      "--quick-generate-key",
+      "Older Test <older@example.invalid>",
+      "rsa2048",
+      "sign",
+      "0",
+    ]);
+
+    await main([
+      "--root",
+      root,
+      "--site",
+      join(root, "site"),
+      "--only",
+      "trusttunnel-client",
+      "--publish",
+      "--sign",
+    ]);
+
+    assert.equal(
+      calls.some((call) => call.url === "https://example.test/older.tar.gz"),
+      false,
+    );
+    assert.equal(
+      calls.some((call) => call.url.startsWith("https://uploads.github.com/")),
+      false,
+    );
+    assert.equal(
+      calls.some(
+        (call) =>
+          call.url === `https://api.github.com/repos/${REPO}/releases` &&
+          call.method === "POST",
+      ),
+      false,
+    );
+    assert.equal(await readFile(join(root, "versions.json"), "utf8"), versionsText);
+    assert.deepEqual(
+      await readFile(
+        join(root, "site", `dists/termux/extras/binary-x86_64`, name),
+      ),
+      debBytes,
+    );
+    assert.match(
+      await readFile(
+        join(root, "site", "dists/termux/extras/binary-x86_64/Packages"),
+        "utf8",
+      ),
+      /Version: 1\.4\.0/,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalToken === undefined) {
+      delete process.env.GITHUB_TOKEN;
+    } else {
+      process.env.GITHUB_TOKEN = originalToken;
+    }
+    if (originalRepository === undefined) {
+      delete process.env.GITHUB_REPOSITORY;
+    } else {
+      process.env.GITHUB_REPOSITORY = originalRepository;
+    }
+    if (originalHome === undefined) {
+      delete process.env.GNUPGHOME;
+    } else {
+      process.env.GNUPGHOME = originalHome;
+    }
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("publish_skips_published_assets", async (t) => {
   if (
     !hasCommand("dpkg-deb") ||

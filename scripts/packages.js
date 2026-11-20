@@ -85,7 +85,7 @@ function parseVersion(tag) {
   };
 }
 
-function compareVersions(leftTag, rightTag) {
+export function compareVersions(leftTag, rightTag) {
   const left = parseVersion(leftTag);
   const right = parseVersion(rightTag);
   for (let index = 0; index < 3; index += 1) {

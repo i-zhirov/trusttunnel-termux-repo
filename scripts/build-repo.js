@@ -17,6 +17,7 @@ import { basename, dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import {
+  compareVersions,
   debName,
   findAsset,
   packages,
@@ -277,26 +278,29 @@ export function unpublishedArches(item, version, releases) {
 export async function publishPackages(options) {
   const fetchImpl = options.fetchImpl ?? fetch;
   for (const item of options.packages) {
-    const version = options.versions[item.name];
-    if (!version) {
-      throw new Error(`no version for package ${item.name}`);
-    }
-    const release = await ensureRelease(
-      options.repo,
-      releaseTag(item.name, version),
-      options.token,
-      fetchImpl,
-    );
-    const prefix = `${item.name}_`;
-    for (const deb of options.debs) {
-      if (basename(deb).startsWith(prefix)) {
-        await uploadAsset(
-          options.repo,
-          release,
-          deb,
-          options.token,
-          fetchImpl,
-        );
+    const skip = options.skip?.has(item.name) === true;
+    if (!skip) {
+      const version = options.versions[item.name];
+      if (!version) {
+        throw new Error(`no version for package ${item.name}`);
+      }
+      const release = await ensureRelease(
+        options.repo,
+        releaseTag(item.name, version),
+        options.token,
+        fetchImpl,
+      );
+      const prefix = `${item.name}_`;
+      for (const deb of options.debs) {
+        if (basename(deb).startsWith(prefix)) {
+          await uploadAsset(
+            options.repo,
+            release,
+            deb,
+            options.token,
+            fetchImpl,
+          );
+        }
       }
     }
     const releases = await listReleases(options.repo, options.token, fetchImpl);
@@ -341,11 +345,17 @@ export async function main(argv = process.argv.slice(2)) {
   const debs = [];
   const nextVersions = { ...versions };
   const dryRunLines = [];
+  const skipped = new Set();
   let storeReleases = null;
 
   for (const item of selected) {
     const release = await fetchLatestRelease(item.repo, token);
     const version = versionFromTag(release.tag_name, item.tagSuffix ?? "");
+    const previous = versions[item.name];
+    if (previous && compareVersions(version, previous) < 0) {
+      skipped.add(item.name);
+      continue;
+    }
     let arches = item.arches;
     if (options.publish && !options.dryRun) {
       if (storeReleases === null) {
@@ -417,10 +427,9 @@ export async function main(argv = process.argv.slice(2)) {
       versions: nextVersions,
       repo,
       token,
+      skip: skipped,
     });
   }
-
-  await writeVersions(options.root, nextVersions);
 
   await assembleSite({
     siteDir: options.site,
@@ -430,6 +439,8 @@ export async function main(argv = process.argv.slice(2)) {
     versions: nextVersions,
     sign: options.sign,
   });
+
+  await writeVersions(options.root, nextVersions);
 
   for (const deb of debs) {
     console.log(deb);
