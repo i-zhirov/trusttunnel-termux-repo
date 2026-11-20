@@ -6,9 +6,9 @@ import { fileURLToPath } from "node:url";
 
 const execFile = promisify(execFileCallback);
 
-const REPO_URL = "https://trusttunnel.github.io/termux-repo/";
+const REPO_URL = "https://i-zhirov.github.io/trusttunnel-termux-repo/";
 const KEY_URL =
-  "https://trusttunnel.github.io/termux-repo/keys/trusttunnel.gpg";
+  "https://i-zhirov.github.io/trusttunnel-termux-repo/keys/trusttunnel.gpg";
 
 function escapeHtml(value) {
   return String(value ?? "")
