@@ -493,6 +493,187 @@ test("publish_conflict", async () => {
 });
 
 
+test("publish_skips_published_assets", async (t) => {
+  if (
+    !hasCommand("dpkg-deb") ||
+    !hasCommand("gpg") ||
+    !hasCommand("python3")
+  ) {
+    t.skip("dpkg-deb, gpg, or python3 is not installed");
+    return;
+  }
+
+  const root = await tempDir("trusttunnel-publish-skip-");
+  const originalFetch = globalThis.fetch;
+  const originalToken = process.env.GITHUB_TOKEN;
+  const originalRepository = process.env.GITHUB_REPOSITORY;
+  const originalHome = process.env.GNUPGHOME;
+  try {
+    await writeFile(
+      join(root, "versions.json"),
+      '{\n  "trusttunnel-client": "1.3.0"\n}\n',
+    );
+    await mkdir(join(root, "templates"), { recursive: true });
+    await writeFile(
+      join(root, "templates/index.html"),
+      "<html>__VERSIONS__</html>",
+    );
+
+    const source = join(root, "source");
+    await mkdir(source, { recursive: true });
+    await writeFile(join(source, "trusttunnel_client"), "upstream binary");
+    await writeFile(join(source, "LICENSE"), "license");
+    const archive = join(root, "asset.tar.gz");
+    await execFile("tar", ["-czf", archive, "-C", source, "."]);
+    const archiveBytes = await readFile(archive);
+    const archiveDigest = digestOf(archiveBytes);
+
+    const seedRoot = join(root, "seed");
+    const seedBinary = join(seedRoot, "trusttunnel_client");
+    const seedLicense = join(seedRoot, "LICENSE");
+    await mkdir(seedRoot, { recursive: true });
+    await writeFile(seedBinary, "published binary");
+    await writeFile(seedLicense, "license");
+    const assetBytes = new Map();
+    for (const arch of ["aarch64", "arm", "x86_64"]) {
+      const name = `trusttunnel-client_1.3.0_${arch}.deb`;
+      const deb = await buildDeb({
+        root: join(seedRoot, arch),
+        packageName: "trusttunnel-client",
+        version: "1.3.0",
+        arch,
+        binaryPath: seedBinary,
+        licensePath: seedLicense,
+      });
+      assetBytes.set(name, await readFile(deb));
+    }
+    const published = seedRelease(
+      1,
+      "trusttunnel-client-v1.3.0",
+      [...assetBytes.keys()],
+      assetBytes,
+    );
+
+    const tarballNames = [
+      "trusttunnel_client-v1.3.0-linux-aarch64.tar.gz",
+      "trusttunnel_client-v1.3.0-linux-armv7.tar.gz",
+      "trusttunnel_client-v1.3.0-linux-x86_64.tar.gz",
+    ];
+    const calls = [];
+    globalThis.fetch = async (url, init = {}) => {
+      calls.push({ url, method: init.method ?? "GET" });
+      if (
+        url ===
+        "https://api.github.com/repos/TrustTunnel/TrustTunnelClient/releases/latest"
+      ) {
+        return jsonResponse({
+          tag_name: "v1.3.0",
+          assets: tarballNames.map((name, index) => ({
+            name,
+            digest: archiveDigest,
+            browser_download_url: `https://example.test/asset-${index}.tar.gz`,
+          })),
+        });
+      }
+      if (url === `https://api.github.com/repos/${REPO}/releases?per_page=100`) {
+        return jsonResponse([published]);
+      }
+      if (url.startsWith("https://example.test/asset-")) {
+        return new Response(archiveBytes, { status: 200 });
+      }
+      if (url.startsWith("https://example.test/assets/")) {
+        const name = url.slice("https://example.test/assets/".length);
+        return new Response(assetBytes.get(name), { status: 200 });
+      }
+      throw new Error(`unexpected request ${init.method ?? "GET"} ${url}`);
+    };
+
+    const gnupg = join(root, "gnupg");
+    await mkdir(gnupg, { recursive: true, mode: 0o700 });
+    process.env.GITHUB_TOKEN = TOKEN;
+    process.env.GITHUB_REPOSITORY = REPO;
+    process.env.GNUPGHOME = gnupg;
+    await execFile("gpg", [
+      "--batch",
+      "--pinentry-mode",
+      "loopback",
+      "--passphrase",
+      "",
+      "--quick-generate-key",
+      "Publish Test <publish@example.invalid>",
+      "rsa2048",
+      "sign",
+      "0",
+    ]);
+
+    await main([
+      "--root",
+      root,
+      "--site",
+      join(root, "site"),
+      "--only",
+      "trusttunnel-client",
+      "--publish",
+      "--sign",
+    ]);
+
+    assert.equal(
+      calls.some((call) => call.url.startsWith("https://uploads.github.com/")),
+      false,
+    );
+    assert.equal(
+      calls.some((call) => call.url.startsWith("https://example.test/asset-")),
+      false,
+    );
+    assert.equal(
+      await readFile(join(root, "site", "dists/termux/InRelease")).then(
+        () => true,
+      ),
+      true,
+    );
+    for (const arch of ["aarch64", "arm", "x86_64"]) {
+      const name = `trusttunnel-client_1.3.0_${arch}.deb`;
+      assert.deepEqual(
+        await readFile(
+          join(root, "site", `dists/termux/extras/binary-${arch}`, name),
+        ),
+        assetBytes.get(name),
+      );
+      assert.equal(
+        await readFile(
+          join(root, "site", `dists/termux/extras/binary-${arch}/Packages`),
+        ).then(() => true),
+        true,
+      );
+    }
+    assert.equal(
+      await readFile(
+        join(root, "site", "dists/termux/extras/binary-x86_64/Packages"),
+        "utf8",
+      ).then((text) => text.includes("Version: 1.3.0")),
+      true,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalToken === undefined) {
+      delete process.env.GITHUB_TOKEN;
+    } else {
+      process.env.GITHUB_TOKEN = originalToken;
+    }
+    if (originalRepository === undefined) {
+      delete process.env.GITHUB_REPOSITORY;
+    } else {
+      process.env.GITHUB_REPOSITORY = originalRepository;
+    }
+    if (originalHome === undefined) {
+      delete process.env.GNUPGHOME;
+    } else {
+      process.env.GNUPGHOME = originalHome;
+    }
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("publish_sign_key_checked_before_upload", async (t) => {
   if (!hasCommand("dpkg-deb") || !hasCommand("gpg")) {
     t.skip("dpkg-deb or gpg is not installed");
@@ -536,6 +717,9 @@ test("publish_sign_key_checked_before_upload", async (t) => {
             browser_download_url: `https://example.test/asset-${index}.tar.gz`,
           })),
         });
+      }
+      if (url === `https://api.github.com/repos/${REPO}/releases?per_page=100`) {
+        return jsonResponse([]);
       }
       if (url.startsWith("https://example.test/asset-")) {
         return new Response(archiveBytes, { status: 200 });

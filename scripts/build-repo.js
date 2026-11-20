@@ -263,6 +263,17 @@ async function fileExists(path) {
   }
 }
 
+export function unpublishedArches(item, version, releases) {
+  const tag = releaseTag(item.name, version);
+  const release = (Array.isArray(releases) ? releases : []).find(
+    (entry) => entry?.tag_name === tag,
+  );
+  const assets = new Set((release?.assets ?? []).map((asset) => asset?.name));
+  return item.arches.filter(
+    (arch) => !assets.has(debName(item.name, version, arch.deb)),
+  );
+}
+
 export async function publishPackages(options) {
   const fetchImpl = options.fetchImpl ?? fetch;
   for (const item of options.packages) {
@@ -322,17 +333,27 @@ export async function main(argv = process.argv.slice(2)) {
   if (options.publish && token.length === 0) {
     throw new Error("--publish needs GITHUB_TOKEN");
   }
+  const repo =
+    process.env.GITHUB_REPOSITORY ?? "i-zhirov/trusttunnel-termux-repo";
   const buildRoot = await mkdtemp(join(tmpdir(), "trusttunnel-repo-"));
   const assetsDir = join(buildRoot, "assets");
   const debsDir = join(buildRoot, "debs");
   const debs = [];
   const nextVersions = { ...versions };
   const dryRunLines = [];
+  let storeReleases = null;
 
   for (const item of selected) {
     const release = await fetchLatestRelease(item.repo, token);
     const version = versionFromTag(release.tag_name, item.tagSuffix ?? "");
-    for (const arch of item.arches) {
+    let arches = item.arches;
+    if (options.publish && !options.dryRun) {
+      if (storeReleases === null) {
+        storeReleases = await listReleases(repo, token);
+      }
+      arches = unpublishedArches(item, version, storeReleases);
+    }
+    for (const arch of arches) {
       const asset = findAsset(release, arch.asset);
       requireDigest(asset);
       if (options.dryRun) {
@@ -394,7 +415,7 @@ export async function main(argv = process.argv.slice(2)) {
       debs,
       debsDir,
       versions: nextVersions,
-      repo: process.env.GITHUB_REPOSITORY ?? "i-zhirov/trusttunnel-termux-repo",
+      repo,
       token,
     });
   }
