@@ -8,6 +8,7 @@
     "node": ">=18"
   },
   "scripts": {
+    "build": "node scripts/build-repo.js",
     "test": "node --test"
   }
 }

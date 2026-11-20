@@ -16,3 +16,9 @@ COPY package.json ./
 COPY versions.json ./
 COPY scripts/ ./scripts/
 RUN npm test
+
+FROM base AS tools
+COPY package.json ./
+COPY versions.json ./
+COPY scripts/ ./scripts/
+CMD ["node", "scripts/build-repo.js"]
