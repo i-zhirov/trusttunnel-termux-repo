@@ -1,0 +1,5 @@
+.git
+site
+node_modules
+*.log
+.sdd
