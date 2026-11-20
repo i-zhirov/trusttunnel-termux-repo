@@ -11,9 +11,12 @@ VERSIONS_BACKUP="$(mktemp)"
 cp versions.json "$VERSIONS_BACKUP"
 
 cleanup() {
-  cp "$VERSIONS_BACKUP" versions.json
-  rm -f "$VERSIONS_BACKUP"
-  rm -rf site-unsigned site-signed
+  cp "$VERSIONS_BACKUP" versions.json 2>/dev/null || true
+  rm -f "$VERSIONS_BACKUP" 2>/dev/null || true
+  if ! rm -rf site-unsigned site-signed 2>/dev/null; then
+    docker run --rm -v "$ROOT:/work" "$TOOLS_IMAGE" \
+      rm -rf /work/site-unsigned /work/site-signed >/dev/null 2>&1 || true
+  fi
 }
 trap cleanup EXIT
 
