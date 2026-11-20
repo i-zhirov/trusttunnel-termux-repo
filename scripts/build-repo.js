@@ -13,16 +13,24 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import {
   debName,
   findAsset,
   packages,
+  releaseTag,
   requireDigest,
   versionFromTag,
 } from "./packages.js";
+import {
+  downloadAsset as downloadReleaseAsset,
+  ensureRelease,
+  listReleases,
+  retainedReleases,
+  uploadAsset,
+} from "./releases.js";
 import { assembleSite } from "./site.js";
 
 const execFile = promisify(execFileCallback);
@@ -35,6 +43,7 @@ export function parseArgs(argv) {
   let dryRun = false;
   let only = null;
   let sign = false;
+  let publish = false;
 
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
@@ -54,6 +63,9 @@ export function parseArgs(argv) {
       case "--sign":
         sign = true;
         break;
+      case "--publish":
+        publish = true;
+        break;
       default:
         throw new Error(`unknown argument: ${argument}`);
     }
@@ -69,7 +81,14 @@ export function parseArgs(argv) {
     dryRun,
     only,
     sign,
+    publish,
   };
+}
+
+export function validateOptions(options) {
+  if (options.publish && !options.sign) {
+    throw new Error("--publish needs --sign");
+  }
 }
 
 function requireValue(argv, index, flag) {
@@ -235,8 +254,64 @@ export async function writeVersions(root, versions) {
   );
 }
 
+async function fileExists(path) {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function publishPackages(options) {
+  const fetchImpl = options.fetchImpl ?? fetch;
+  for (const item of options.packages) {
+    const version = options.versions[item.name];
+    if (!version) {
+      throw new Error(`no version for package ${item.name}`);
+    }
+    const release = await ensureRelease(
+      options.repo,
+      releaseTag(item.name, version),
+      options.token,
+      fetchImpl,
+    );
+    const prefix = `${item.name}_`;
+    for (const deb of options.debs) {
+      if (basename(deb).startsWith(prefix)) {
+        await uploadAsset(
+          options.repo,
+          release,
+          deb,
+          options.token,
+          fetchImpl,
+        );
+      }
+    }
+    const releases = await listReleases(options.repo, options.token, fetchImpl);
+    for (const retained of retainedReleases(releases, item.name)) {
+      for (const asset of retained?.assets ?? []) {
+        if (!String(asset?.name ?? "").endsWith(".deb")) {
+          continue;
+        }
+        const destination = join(options.debsDir, asset.name);
+        if (await fileExists(destination)) {
+          continue;
+        }
+        await downloadReleaseAsset(
+          asset,
+          destination,
+          options.token,
+          fetchImpl,
+        );
+      }
+    }
+  }
+}
+
 export async function main(argv = process.argv.slice(2)) {
   const options = parseArgs(argv);
+  validateOptions(options);
   const versions = JSON.parse(
     await readFile(join(options.root, "versions.json"), "utf8"),
   );
@@ -244,8 +319,12 @@ export async function main(argv = process.argv.slice(2)) {
     (item) => !options.only || item.name === options.only,
   );
   const token = process.env.GITHUB_TOKEN ?? "";
+  if (options.publish && token.length === 0) {
+    throw new Error("--publish needs GITHUB_TOKEN");
+  }
   const buildRoot = await mkdtemp(join(tmpdir(), "trusttunnel-repo-"));
   const assetsDir = join(buildRoot, "assets");
+  const debsDir = join(buildRoot, "debs");
   const debs = [];
   const nextVersions = { ...versions };
   const dryRunLines = [];
@@ -297,20 +376,34 @@ export async function main(argv = process.argv.slice(2)) {
     return;
   }
 
-  await writeVersions(options.root, nextVersions);
-
   let publicKeyPath = null;
   if (options.sign) {
     publicKeyPath = join(buildRoot, "trusttunnel.gpg");
     const { stdout } = await execFile("gpg", ["--export"], {
       encoding: "buffer",
     });
+    if (stdout.length === 0) {
+      throw new Error("no signing key in GNUPGHOME");
+    }
     await writeFile(publicKeyPath, stdout);
   }
 
+  if (options.publish) {
+    await publishPackages({
+      packages: selected,
+      debs,
+      debsDir,
+      versions: nextVersions,
+      repo: process.env.GITHUB_REPOSITORY ?? "i-zhirov/trusttunnel-termux-repo",
+      token,
+    });
+  }
+
+  await writeVersions(options.root, nextVersions);
+
   await assembleSite({
     siteDir: options.site,
-    debsDir: join(buildRoot, "debs"),
+    debsDir,
     publicKeyPath,
     templatePath: join(options.root, "templates/index.html"),
     versions: nextVersions,

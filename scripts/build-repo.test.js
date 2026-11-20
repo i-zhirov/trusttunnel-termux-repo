@@ -10,8 +10,11 @@ import { join } from "node:path";
 import {
   buildDeb,
   extractAsset,
+  main,
   parseArgs,
+  publishPackages,
   resolveExtracted,
+  validateOptions,
   verifySha256,
   writeVersions,
 } from "./build-repo.js";
@@ -31,6 +34,95 @@ function hasCommand(command) {
   }
 }
 
+const REPO = "i-zhirov/trusttunnel-termux-repo";
+const TOKEN = "test-token";
+
+function jsonResponse(body, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function digestOf(bytes) {
+  return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+}
+
+function seedRelease(id, tag, names, assetBytes) {
+  return {
+    id,
+    tag_name: tag,
+    assets: names.map((name, index) => ({
+      id: id * 100 + index,
+      name,
+      digest: digestOf(assetBytes.get(name)),
+      browser_download_url: `https://example.test/assets/${name}`,
+    })),
+  };
+}
+
+function createReleaseStore(seedReleases, assetBytes) {
+  const releases = seedReleases;
+  const calls = [];
+  let nextReleaseId = 100;
+  let nextAssetId = 1000;
+
+  const fetchImpl = async (url, init = {}) => {
+    const method = init.method ?? "GET";
+    calls.push({ url, method });
+
+    if (url === `https://api.github.com/repos/${REPO}/releases?per_page=100`) {
+      return jsonResponse(releases);
+    }
+    if (
+      url === `https://api.github.com/repos/${REPO}/releases` &&
+      method === "POST"
+    ) {
+      const body = JSON.parse(init.body);
+      const release = {
+        id: nextReleaseId,
+        tag_name: body.tag_name,
+        assets: [],
+      };
+      nextReleaseId += 1;
+      releases.push(release);
+      return jsonResponse(release, 201);
+    }
+
+    const upload = url.match(
+      /^https:\/\/uploads\.github\.com\/repos\/[^/]+\/[^/]+\/releases\/(\d+)\/assets\?name=(.+)$/,
+    );
+    if (upload && method === "POST") {
+      const release = releases.find((item) => item.id === Number(upload[1]));
+      const name = decodeURIComponent(upload[2]);
+      const bytes = Buffer.from(init.body);
+      const asset = {
+        id: nextAssetId,
+        name,
+        digest: digestOf(bytes),
+        browser_download_url: `https://example.test/assets/${name}`,
+      };
+      nextAssetId += 1;
+      assetBytes.set(name, bytes);
+      release.assets.push(asset);
+      return jsonResponse(asset, 201);
+    }
+
+    if (url.startsWith("https://example.test/assets/")) {
+      const name = url.slice("https://example.test/assets/".length);
+      const bytes = assetBytes.get(name);
+      if (!bytes) {
+        throw new Error(`no bytes for ${name}`);
+      }
+      return new Response(bytes, { status: 200 });
+    }
+
+    throw new Error(`unexpected request ${method} ${url}`);
+  };
+
+  return { calls, fetchImpl };
+}
+
 test("parse_args", () => {
   const defaults = parseArgs([]);
   assert.equal(defaults.root, process.cwd());
@@ -38,6 +130,7 @@ test("parse_args", () => {
   assert.equal(defaults.dryRun, false);
   assert.equal(defaults.only, null);
   assert.equal(defaults.sign, false);
+  assert.equal(defaults.publish, false);
 
   const options = parseArgs([
     "--root",
@@ -46,12 +139,14 @@ test("parse_args", () => {
     "--only",
     "trusttunnel",
     "--sign",
+    "--publish",
   ]);
   assert.equal(options.root, "/tmp/root");
   assert.equal(options.site, join("/tmp/root", "site"));
   assert.equal(options.dryRun, true);
   assert.equal(options.only, "trusttunnel");
   assert.equal(options.sign, true);
+  assert.equal(options.publish, true);
 
   const explicitSite = parseArgs(["--site", "/tmp/site", "--root", "/tmp/root"]);
   assert.equal(explicitSite.site, "/tmp/site");
@@ -59,6 +154,15 @@ test("parse_args", () => {
   assert.throws(() => parseArgs(["--unknown"]), /unknown/i);
   assert.throws(() => parseArgs(["--root"]), /value/i);
   assert.throws(() => parseArgs(["--only", "nope"]), /unknown/i);
+});
+
+test("validate_options", () => {
+  assert.throws(
+    () => validateOptions({ publish: true, sign: false }),
+    /sign/i,
+  );
+  assert.doesNotThrow(() => validateOptions({ publish: true, sign: true }));
+  assert.doesNotThrow(() => validateOptions({ publish: false, sign: false }));
 });
 
 test("verify_sha256", async () => {
@@ -165,5 +269,319 @@ test("write_versions", async () => {
     );
   } finally {
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("publish_packages", async () => {
+  const dir = await tempDir("trusttunnel-publish-");
+  try {
+    const debsDir = join(dir, "debs");
+    await mkdir(debsDir, { recursive: true });
+
+    const assetBytes = new Map([
+      ["trusttunnel-client_1.2.0_x86_64.deb", Buffer.from("client 1.2.0")],
+      ["trusttunnel-client_1.1.0_x86_64.deb", Buffer.from("client 1.1.0")],
+      ["trusttunnel-client_1.0.0_x86_64.deb", Buffer.from("client 1.0.0")],
+      ["trusttunnel_1.1.0_x86_64.deb", Buffer.from("endpoint 1.1.0")],
+      ["trusttunnel_1.0.0_aarch64.deb", Buffer.from("endpoint 1.0.0")],
+    ]);
+    const seedReleases = [
+      seedRelease(
+        1,
+        "trusttunnel-client-v1.2.0",
+        ["trusttunnel-client_1.2.0_x86_64.deb"],
+        assetBytes,
+      ),
+      seedRelease(
+        2,
+        "trusttunnel-client-v1.1.0",
+        ["trusttunnel-client_1.1.0_x86_64.deb"],
+        assetBytes,
+      ),
+      seedRelease(
+        3,
+        "trusttunnel-client-v1.0.0",
+        ["trusttunnel-client_1.0.0_x86_64.deb"],
+        assetBytes,
+      ),
+      seedRelease(
+        4,
+        "trusttunnel-v1.1.0",
+        ["trusttunnel_1.1.0_x86_64.deb"],
+        assetBytes,
+      ),
+      seedRelease(
+        5,
+        "trusttunnel-v1.0.0",
+        ["trusttunnel_1.0.0_aarch64.deb"],
+        assetBytes,
+      ),
+    ];
+    const { calls, fetchImpl } = createReleaseStore(seedReleases, assetBytes);
+
+    const currentNames = [
+      "trusttunnel-client_1.3.0_aarch64.deb",
+      "trusttunnel-client_1.3.0_x86_64.deb",
+      "trusttunnel_1.3.1_x86_64.deb",
+    ];
+    const debs = [];
+    for (const name of currentNames) {
+      const path = join(debsDir, name);
+      await writeFile(path, `bytes ${name}`);
+      debs.push(path);
+    }
+    await writeFile(
+      join(debsDir, "trusttunnel-client_1.2.0_x86_64.deb"),
+      "kept local",
+    );
+
+    await publishPackages({
+      packages: [{ name: "trusttunnel-client" }, { name: "trusttunnel" }],
+      debs,
+      debsDir,
+      versions: { "trusttunnel-client": "1.3.0", trusttunnel: "1.3.1" },
+      repo: REPO,
+      token: TOKEN,
+      fetchImpl,
+    });
+
+    const lists = calls.filter(
+      (call) =>
+        call.url === `https://api.github.com/repos/${REPO}/releases?per_page=100`,
+    );
+    assert.equal(lists.length, 4);
+    assert.deepEqual(lists.map((call) => call.method), [
+      "GET",
+      "GET",
+      "GET",
+      "GET",
+    ]);
+
+    const creates = calls.filter(
+      (call) => call.url === `https://api.github.com/repos/${REPO}/releases`,
+    );
+    assert.deepEqual(creates.map((call) => call.method), ["POST", "POST"]);
+
+    const uploads = calls.filter((call) =>
+      call.url.startsWith("https://uploads.github.com/"),
+    );
+    assert.deepEqual(uploads.map((call) => call.method), [
+      "POST",
+      "POST",
+      "POST",
+    ]);
+    const expectedUploads = [
+      "100 trusttunnel-client_1.3.0_aarch64.deb",
+      "100 trusttunnel-client_1.3.0_x86_64.deb",
+      "101 trusttunnel_1.3.1_x86_64.deb",
+    ];
+    assert.deepEqual(
+      uploads
+        .map((call) => {
+          const match = call.url.match(
+            /\/releases\/(\d+)\/assets\?name=(.+)$/,
+          );
+          return `${match[1]} ${decodeURIComponent(match[2])}`;
+        })
+        .sort(),
+      [...expectedUploads].sort(),
+    );
+
+    const downloadPrefix = "https://example.test/assets/";
+    const downloads = calls.filter((call) =>
+      call.url.startsWith(downloadPrefix),
+    );
+    assert.deepEqual(downloads.map((call) => call.method), [
+      "GET",
+      "GET",
+      "GET",
+    ]);
+    assert.deepEqual(
+      downloads.map((call) => call.url.slice(downloadPrefix.length)).sort(),
+      [
+        "trusttunnel-client_1.1.0_x86_64.deb",
+        "trusttunnel_1.0.0_aarch64.deb",
+        "trusttunnel_1.1.0_x86_64.deb",
+      ].sort(),
+    );
+
+    assert.equal(
+      calls.some(
+        (call) => call.method === "PATCH" || call.method === "PUT",
+      ),
+      false,
+    );
+    assert.equal(
+      await readFile(
+        join(debsDir, "trusttunnel-client_1.2.0_x86_64.deb"),
+        "utf8",
+      ),
+      "kept local",
+    );
+    assert.deepEqual(
+      await readFile(join(debsDir, "trusttunnel-client_1.1.0_x86_64.deb")),
+      assetBytes.get("trusttunnel-client_1.1.0_x86_64.deb"),
+    );
+    assert.deepEqual(
+      await readFile(join(debsDir, "trusttunnel_1.1.0_x86_64.deb")),
+      assetBytes.get("trusttunnel_1.1.0_x86_64.deb"),
+    );
+    assert.deepEqual(
+      await readFile(join(debsDir, "trusttunnel_1.0.0_aarch64.deb")),
+      assetBytes.get("trusttunnel_1.0.0_aarch64.deb"),
+    );
+    await assert.rejects(() =>
+      readFile(join(debsDir, "trusttunnel-client_1.0.0_x86_64.deb")),
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("publish_conflict", async () => {
+  const dir = await tempDir("trusttunnel-publish-conflict-");
+  try {
+    const debsDir = join(dir, "debs");
+    await mkdir(debsDir, { recursive: true });
+    const name = "trusttunnel-client_1.3.0_x86_64.deb";
+    const deb = join(debsDir, name);
+    await writeFile(deb, "local bytes");
+
+    const existing = {
+      id: 7,
+      tag_name: "trusttunnel-client-v1.3.0",
+      assets: [
+        {
+          id: 8,
+          name,
+          digest: `sha256:${createHash("sha256").update("other bytes").digest("hex")}`,
+        },
+      ],
+    };
+    const calls = [];
+    const fetchImpl = async (url, init = {}) => {
+      const method = init.method ?? "GET";
+      calls.push({ url, method });
+      if (
+        url === `https://api.github.com/repos/${REPO}/releases?per_page=100`
+      ) {
+        return jsonResponse([existing]);
+      }
+      throw new Error(`unexpected request ${method} ${url}`);
+    };
+
+    await assert.rejects(
+      () =>
+        publishPackages({
+          packages: [{ name: "trusttunnel-client" }],
+          debs: [deb],
+          debsDir,
+          versions: { "trusttunnel-client": "1.3.0" },
+          repo: REPO,
+          token: TOKEN,
+          fetchImpl,
+        }),
+      /digest|conflict/i,
+    );
+    assert.equal(
+      calls.some((call) => call.url.startsWith("https://uploads.github.com/")),
+      false,
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+
+test("publish_sign_key_checked_before_upload", async (t) => {
+  if (!hasCommand("dpkg-deb") || !hasCommand("gpg")) {
+    t.skip("dpkg-deb or gpg is not installed");
+    return;
+  }
+
+  const root = await tempDir("trusttunnel-publish-order-");
+  const originalFetch = globalThis.fetch;
+  const originalToken = process.env.GITHUB_TOKEN;
+  const originalHome = process.env.GNUPGHOME;
+  try {
+    const gnupg = join(root, "gnupg");
+    await mkdir(gnupg, { recursive: true, mode: 0o700 });
+    await writeFile(join(root, "versions.json"), "{}\n");
+
+    const source = join(root, "source");
+    await mkdir(source, { recursive: true });
+    await writeFile(join(source, "trusttunnel_endpoint"), "binary");
+    await writeFile(join(source, "LICENSE"), "license");
+    const archive = join(root, "asset.tar.gz");
+    await execFile("tar", ["-czf", archive, "-C", source, "."]);
+    const archiveBytes = await readFile(archive);
+    const digest = digestOf(archiveBytes);
+
+    const assetNames = [
+      "trusttunnel_endpoint-v1.3.1-linux-aarch64.tar.gz",
+      "trusttunnel_endpoint-v1.3.1-linux-x86_64.tar.gz",
+    ];
+    const calls = [];
+    globalThis.fetch = async (url, init = {}) => {
+      calls.push({ url, method: init.method ?? "GET" });
+      if (
+        url ===
+        "https://api.github.com/repos/TrustTunnel/TrustTunnel/releases/latest"
+      ) {
+        return jsonResponse({
+          tag_name: "v1.3.1",
+          assets: assetNames.map((name, index) => ({
+            name,
+            digest,
+            browser_download_url: `https://example.test/asset-${index}.tar.gz`,
+          })),
+        });
+      }
+      if (url.startsWith("https://example.test/asset-")) {
+        return new Response(archiveBytes, { status: 200 });
+      }
+      throw new Error(`unexpected request ${init.method ?? "GET"} ${url}`);
+    };
+    process.env.GITHUB_TOKEN = TOKEN;
+    process.env.GNUPGHOME = gnupg;
+
+    await assert.rejects(
+      () =>
+        main([
+          "--root",
+          root,
+          "--site",
+          join(root, "site"),
+          "--only",
+          "trusttunnel",
+          "--publish",
+          "--sign",
+        ]),
+      /signing key/i,
+    );
+    assert.equal(
+      calls.some((call) => call.url.startsWith("https://uploads.github.com/")),
+      false,
+    );
+    assert.equal(
+      calls.some(
+        (call) =>
+          call.url === `https://api.github.com/repos/${REPO}/releases`,
+      ),
+      false,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalToken === undefined) {
+      delete process.env.GITHUB_TOKEN;
+    } else {
+      process.env.GITHUB_TOKEN = originalToken;
+    }
+    if (originalHome === undefined) {
+      delete process.env.GNUPGHOME;
+    } else {
+      process.env.GNUPGHOME = originalHome;
+    }
+    await rm(root, { recursive: true, force: true });
   }
 });
